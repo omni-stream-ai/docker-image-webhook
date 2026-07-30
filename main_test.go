@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +46,97 @@ func TestPayloadAcceptsAdditionalAliyunFields(t *testing.T) {
 	response := httptest.NewRecorder()
 	s.payloadHandler(response, req)
 	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPayloadPullsGenericRegistryImages(t *testing.T) {
+	for name, body := range map[string]string{
+		"top-level image":   `{"image":"ghcr.io/acme/widget","tag":"v1.2.3"}`,
+		"string repository": `{"repository":"registry.example.com:5000/team/service","tag":"stable"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.allowedRepos = map[string]struct{}{
+				"ghcr.io/acme/widget":                    {},
+				"registry.example.com:5000/team/service": {},
+			}
+			var pulled string
+			s := &server{config: cfg, pull: func(_ context.Context, image string) error {
+				pulled = image
+				return nil
+			}}
+			req := httptest.NewRequest(http.MethodPost, "/payload?secret=test-secret", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			s.payloadHandler(response, req)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			if pulled == "" {
+				t.Fatal("pull was not called")
+			}
+		})
+	}
+}
+
+func TestFixedRepositorySupportsDockerHubStyleName(t *testing.T) {
+	cfg := testConfig()
+	cfg.fixedRepository = "acme/widget"
+	cfg.allowedRepos = nil
+	s := &server{config: cfg}
+	image, err := s.imageFor(payload{Tag: "latest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image != "acme/widget:latest" {
+		t.Fatalf("image = %q", image)
+	}
+}
+
+func TestPayloadRunsPostPullCommandAfterPull(t *testing.T) {
+	cfg := testConfig()
+	cfg.postPullCommand = "/usr/local/bin/redeploy"
+	var steps []string
+	s := &server{
+		config: cfg,
+		pull: func(_ context.Context, image string) error {
+			steps = append(steps, "pull:"+image)
+			return nil
+		},
+		postPull: func(_ context.Context, image string) error {
+			steps = append(steps, "post:"+image)
+			return nil
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/payload?secret=test-secret", strings.NewReader(testPayload("namespace/repo-test", "latest")))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	s.payloadHandler(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	want := []string{"pull:registry.cn-hangzhou.aliyuncs.com/namespace/repo-test:latest", "post:registry.cn-hangzhou.aliyuncs.com/namespace/repo-test:latest"}
+	if strings.Join(steps, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("steps = %v, want %v", steps, want)
+	}
+}
+
+func TestPayloadReportsPostPullFailure(t *testing.T) {
+	cfg := testConfig()
+	cfg.postPullCommand = "/usr/local/bin/redeploy"
+	s := &server{
+		config:   cfg,
+		pull:     func(_ context.Context, _ string) error { return nil },
+		postPull: func(_ context.Context, _ string) error { return errors.New("deploy failed") },
+	}
+	req := httptest.NewRequest(http.MethodPost, "/payload?secret=test-secret", strings.NewReader(testPayload("namespace/repo-test", "latest")))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	s.payloadHandler(response, req)
+	if response.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }

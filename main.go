@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -22,21 +23,46 @@ const maxBodyBytes = 64 << 10
 
 var (
 	repositoryPartPattern = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
+	portPattern           = regexp.MustCompile(`^[0-9]{1,5}$`)
 	tagPattern            = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 )
 
 type payload struct {
+	Image    string `json:"image"`
+	Tag      string `json:"tag"`
+	Registry string `json:"registry"`
 	PushData struct {
 		Digest   string `json:"digest"`
 		PushedAt string `json:"pushed_at"`
 		Tag      string `json:"tag"`
 	} `json:"push_data"`
-	Repository struct {
-		Name         string `json:"name"`
-		Namespace    string `json:"namespace"`
-		Region       string `json:"region"`
-		RepoFullName string `json:"repo_full_name"`
-	} `json:"repository"`
+	Repository repositoryPayload `json:"repository"`
+}
+
+// repositoryPayload accepts both the object shape used by Alibaba Cloud and
+// the string shape used by several generic registry webhooks.
+type repositoryPayload struct {
+	Image        string `json:"image"`
+	Registry     string `json:"registry"`
+	FullName     string `json:"full_name"`
+	Name         string `json:"name"`
+	Namespace    string `json:"namespace"`
+	Region       string `json:"region"`
+	RepoFullName string `json:"repo_full_name"`
+}
+
+func (p *repositoryPayload) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '"' {
+		return json.Unmarshal(data, &p.Image)
+	}
+	type alias repositoryPayload
+	var value alias
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*p = repositoryPayload(value)
+	return nil
 }
 
 type config struct {
@@ -47,12 +73,14 @@ type config struct {
 	allowedRepos     map[string]struct{}
 	pullTimeout      time.Duration
 	registryTemplate string
+	postPullCommand  string
 }
 
 type server struct {
-	config  config
-	pulling atomic.Bool
-	pull    func(context.Context, string) error
+	config   config
+	pulling  atomic.Bool
+	pull     func(context.Context, string) error
+	postPull func(context.Context, string) error
 }
 
 func main() {
@@ -63,6 +91,7 @@ func main() {
 
 	s := &server{config: cfg}
 	s.pull = s.pullImage
+	s.postPull = s.runPostPull
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/payload", s.payloadHandler)
@@ -88,6 +117,7 @@ func loadConfig() (config, error) {
 		allowedRepos:     parseList(os.Getenv("WEBHOOK_ALLOWED_REPOSITORIES")),
 		pullTimeout:      10 * time.Minute,
 		registryTemplate: envOr("WEBHOOK_REGISTRY_TEMPLATE", "registry.%s.aliyuncs.com"),
+		postPullCommand:  strings.TrimSpace(os.Getenv("WEBHOOK_POST_PULL_COMMAND")),
 	}
 	if cfg.secret == "" {
 		return config{}, errors.New("WEBHOOK_SECRET is required")
@@ -158,35 +188,77 @@ func (s *server) payloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("image pull completed for %s", image)
+	if s.config.postPullCommand != "" {
+		postPull := s.postPull
+		if postPull == nil {
+			postPull = s.runPostPull
+		}
+		if err := postPull(ctx, image); err != nil {
+			log.Printf("post-pull command failed for %s: %v", image, err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "post-pull command failed"})
+			return
+		}
+		log.Printf("post-pull command completed for %s", image)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "pulled", "image": image})
 }
 
 func (s *server) imageFor(event payload) (string, error) {
-	fullName := strings.TrimSpace(event.Repository.RepoFullName)
-	if fullName == "" {
-		fullName = event.Repository.Namespace + "/" + event.Repository.Name
+	tag := strings.TrimSpace(event.Tag)
+	if tag == "" {
+		tag = strings.TrimSpace(event.PushData.Tag)
 	}
-	if !validRepository(fullName) || !tagPattern.MatchString(event.PushData.Tag) {
+	if !tagPattern.MatchString(tag) {
 		return "", errors.New("invalid repository or tag")
 	}
 
 	if s.config.fixedRepository != "" {
-		if !validImageRepository(s.config.fixedRepository) {
+		if !validConfiguredRepository(s.config.fixedRepository) {
 			return "", errors.New("invalid configured image repository")
 		}
-		return s.config.fixedRepository + ":" + event.PushData.Tag, nil
+		return s.config.fixedRepository + ":" + tag, nil
 	}
-	if _, ok := s.config.allowedRepos[fullName]; !ok {
-		return "", errors.New("repository is not allowed")
+
+	image := strings.TrimSpace(event.Image)
+	if image == "" {
+		image = strings.TrimSpace(event.Repository.Image)
 	}
-	if !repositoryPartPattern.MatchString(event.Repository.Region) {
-		return "", errors.New("invalid region")
+	fullName := strings.TrimSpace(event.Repository.RepoFullName)
+	if fullName == "" {
+		fullName = strings.TrimSpace(event.Repository.FullName)
 	}
-	host := fmt.Sprintf(s.config.registryTemplate, event.Repository.Region)
-	if !validRegistryHost(host) {
-		return "", errors.New("invalid registry host")
+	if fullName == "" {
+		fullName = strings.TrimSpace(event.Repository.Namespace + "/" + event.Repository.Name)
 	}
-	return host + "/" + fullName + ":" + event.PushData.Tag, nil
+	registry := strings.TrimSpace(event.Registry)
+	if registry == "" {
+		registry = strings.TrimSpace(event.Repository.Registry)
+	}
+	if image == "" && registry != "" && validRegistryHost(registry) && validRepository(fullName) {
+		image = registry + "/" + fullName
+	}
+	if image == "" && event.Repository.Region != "" && validRepository(fullName) {
+		if !repositoryPartPattern.MatchString(event.Repository.Region) {
+			return "", errors.New("invalid region")
+		}
+		image = fmt.Sprintf(s.config.registryTemplate, event.Repository.Region) + "/" + fullName
+	}
+	if !validImageReference(image) || !repositoryAllowed(image, fullName, s.config.allowedRepos) {
+		return "", errors.New("repository is not allowed or image is invalid")
+	}
+	return image + ":" + tag, nil
+}
+
+func repositoryAllowed(image, fullName string, allowed map[string]struct{}) bool {
+	repository := image
+	if index := strings.LastIndex(repository, ":"); index > strings.LastIndex(repository, "/") {
+		repository = repository[:index]
+	}
+	if _, ok := allowed[repository]; ok {
+		return true
+	}
+	_, ok := allowed[fullName]
+	return ok
 }
 
 func (s *server) pullImage(ctx context.Context, image string) error {
@@ -198,6 +270,23 @@ func (s *server) pullImage(ctx context.Context, image string) error {
 			message = message[len(message)-2000:]
 		}
 		return fmt.Errorf("%w: %s", err, message)
+	}
+	return nil
+}
+
+func (s *server) runPostPull(ctx context.Context, image string) error {
+	command := exec.CommandContext(ctx, "/bin/sh", "-c", s.config.postPullCommand)
+	command.Env = append(os.Environ(), "WEBHOOK_IMAGE="+image)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if len(message) > 2000 {
+			message = message[len(message)-2000:]
+		}
+		if message != "" {
+			return fmt.Errorf("%w: %s", err, message)
+		}
+		return err
 	}
 	return nil
 }
@@ -217,6 +306,13 @@ func validRepository(value string) bool {
 	if len(parts) < 2 {
 		return false
 	}
+	return validRepositoryPath(parts)
+}
+
+func validRepositoryPath(parts []string) bool {
+	if len(parts) == 0 {
+		return false
+	}
 	for _, part := range parts {
 		if !repositoryPartPattern.MatchString(part) {
 			return false
@@ -230,10 +326,40 @@ func validImageRepository(value string) bool {
 	if len(parts) < 2 || !validRegistryHost(parts[0]) {
 		return false
 	}
-	return validRepository(strings.Join(parts[1:], "/"))
+	return validRepositoryPath(parts[1:])
+}
+
+func validConfiguredRepository(value string) bool {
+	if validImageRepository(value) || validRepository(value) {
+		return true
+	}
+	return repositoryPartPattern.MatchString(value)
+}
+
+func validImageReference(value string) bool {
+	if strings.ContainsAny(value, "@ \t\r\n") || value == "" {
+		return false
+	}
+	if index := strings.LastIndex(value, ":"); index > strings.LastIndex(value, "/") {
+		value = value[:index]
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) == 1 {
+		return repositoryPartPattern.MatchString(value)
+	}
+	if validRegistryHost(parts[0]) && validRepositoryPath(parts[1:]) {
+		return true
+	}
+	return validRepositoryPath(parts)
 }
 
 func validRegistryHost(value string) bool {
+	if host, port, found := strings.Cut(value, ":"); found {
+		if !repositoryPartPattern.MatchString(host) || !portPattern.MatchString(port) {
+			return false
+		}
+		value = host
+	}
 	if len(value) > 253 || strings.Contains(value, "..") {
 		return false
 	}

@@ -1,61 +1,97 @@
 # Image pull webhook
 
-一个仅使用 Go 标准库的轻量 webhook。接收阿里云容器镜像服务的构建完成事件，校验密钥和仓库白名单后执行：
+A lightweight webhook that uses only the Go standard library. It accepts image-push events from any container registry, validates the secret and repository allowlist, then runs:
 
 ```text
-podman pull registry.<region>.aliyuncs.com/<namespace>/<name>:<tag>
+podman pull <registry>/<repository>:<tag>
 ```
 
-也可以通过环境变量切换为 Docker。程序直接传递命令参数，不会通过 shell 执行 payload 内容。
+The container engine can be switched to Docker with an environment variable. Image pull arguments are passed directly; payload content is never executed through a shell. The optional post-pull command is executed only from trusted local configuration.
 
-## 构建和运行
+## Build and run
 
 ```bash
 cd image-pull-webhook
 go test ./...
 go build -o image-pull-webhook .
 
-WEBHOOK_SECRET='生成一个足够长的随机密钥' \
-WEBHOOK_ALLOWED_REPOSITORIES='namespace/repo-test' \
+WEBHOOK_SECRET='generate-a-long-random-secret' \
+WEBHOOK_ALLOWED_REPOSITORIES='ghcr.io/namespace/repo-test' \
 WEBHOOK_CONTAINER_ENGINE=podman \
 ./image-pull-webhook
 ```
 
-默认只监听 `127.0.0.1:19090`，建议由已有的 HTTPS 反向代理暴露 `/payload`。若确实要直接监听公网，可设置 `WEBHOOK_LISTEN_ADDR=0.0.0.0:19090`，并在防火墙中限制来源。
+By default, the service listens only on `127.0.0.1:19090`. It is recommended to expose `/payload` through an existing HTTPS reverse proxy. If it must listen publicly, set `WEBHOOK_LISTEN_ADDR=0.0.0.0:19090` and restrict the source in your firewall.
 
-如果仓库是私有的，需要先用运行该服务的用户执行 `podman login` 或 `docker login`。systemd 示例以 root 运行，因此登录凭据也必须配置在 root 用户下。
+For private repositories, run `podman login` or `docker login` as the user that runs this service. The systemd example runs as root, so registry credentials must also be configured for root.
 
-安装 systemd 服务：
+## systemd installation
+
+On the first installation, specify the only repository allowed to trigger pulls. Use its full image repository name for generic registry events. The script builds the program, generates a random secret, installs the systemd unit, and starts the service:
 
 ```bash
-sudo install -m 0755 image-pull-webhook /usr/local/bin/image-pull-webhook
-sudo install -d -m 0750 /etc/drawing-agent
-sudo install -m 0600 webhook.env.example /etc/drawing-agent/image-pull-webhook.env
-sudo install -m 0644 image-pull-webhook.service /etc/systemd/system/image-pull-webhook.service
-sudo editor /etc/drawing-agent/image-pull-webhook.env
-sudo systemctl daemon-reload
-sudo systemctl enable --now image-pull-webhook
+chmod +x install.sh
+sudo ./install.sh --repository ghcr.io/namespace/repo-test
 ```
 
-`webhook.env.example` 是环境文件模板。必须设置以下二者之一：
+Use `--engine docker` to switch to Docker, or `--listen 0.0.0.0:19090` to change the listen address. Running the installation script again updates the program and unit, but does not overwrite the existing `/etc/drawing-agent/image-pull-webhook.env` or secret.
 
-- `WEBHOOK_ALLOWED_REPOSITORIES`：逗号分隔的 payload 仓库白名单，例如 `namespace/repo-test,namespace/another-repo`。镜像地址由 payload 的 region 和仓库名生成。
-- `WEBHOOK_IMAGE_REPOSITORY`：固定完整镜像仓库，例如 `registry.cn-hangzhou.aliyuncs.com/namespace/repo-test`。收到合法 payload 后只会拉取这个仓库对应的 tag。
-
-## 请求
+Common management commands:
 
 ```bash
-curl -X POST 'http://127.0.0.1:19090/payload?secret=你的密钥' \
+sudo systemctl status image-pull-webhook
+sudo systemctl restart image-pull-webhook
+sudo systemctl stop image-pull-webhook
+sudo journalctl -u image-pull-webhook -f
+```
+
+After changing the configuration, run `sudo systemctl restart image-pull-webhook`. The script prints the generated `WEBHOOK_SECRET` only after the first installation; it can later be viewed from the environment file with root privileges.
+
+`webhook.env.example` is an environment file template. Exactly one of the following must be configured:
+
+- `WEBHOOK_ALLOWED_REPOSITORIES`: A comma-separated allowlist of image repositories, such as `ghcr.io/namespace/repo-test,registry.example.com/team/app`. The value must exactly match the image repository from a generic event. Alibaba Cloud's legacy repository path, such as `namespace/repo-test`, is also supported.
+- `WEBHOOK_IMAGE_REPOSITORY`: A fixed image repository, such as `ghcr.io/namespace/repo-test`. After a valid payload is received, only the corresponding tag from this repository is pulled.
+- `WEBHOOK_REGISTRY_TEMPLATE`: An optional legacy compatibility setting for Alibaba Cloud Container Registry events that provide `region` and a repository path but no image reference. Its default is `registry.%s.aliyuncs.com`.
+- `WEBHOOK_POST_PULL_COMMAND`: An optional command to run after a successful pull. It is executed by `/bin/sh -c` with the full pulled image in `WEBHOOK_IMAGE`. A command failure returns `502`; the image remains pulled, but the webhook does not report a successful deployment.
+
+For example, create `/usr/local/bin/redeploy-my-app` with a fixed deployment command:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+docker compose -f /srv/my-app/compose.yml up -d --force-recreate app
+```
+
+Then configure:
+
+```env
+WEBHOOK_POST_PULL_COMMAND=/usr/local/bin/redeploy-my-app
+```
+
+The post-pull command is trusted administrator configuration and is never taken from the webhook payload. Since the systemd unit runs as root, make the script root-owned and writable only by trusted administrators.
+
+## Requests
+
+The recommended portable event format is:
+
+```json
+{"image":"ghcr.io/namespace/repo-test","tag":"latest"}
+```
+
+An event may instead provide `registry` and a repository object with `full_name`, for example `{"registry":"registry.example.com:5000","repository":{"full_name":"team/app"},"tag":"latest"}`. A repository string is treated as a full image repository. Existing Alibaba Cloud Container Registry payloads using `push_data`, `repository.region`, and `repository.repo_full_name` remain supported.
+
+```bash
+curl -X POST 'http://127.0.0.1:19090/payload?secret=your-secret' \
   -H 'Content-Type: application/json' \
   --data-binary @payload.json
 ```
 
-成功返回：
+Successful response:
 
 ```json
-{"image":"registry.cn-hangzhou.aliyuncs.com/namespace/repo-test:latest","status":"pulled"}
+{"image":"ghcr.io/namespace/repo-test:latest","status":"pulled"}
 ```
 
-健康检查为 `GET /health`。同一时间只允许一个 pull；已有任务运行时返回 `409`。pull 默认最多运行 10 分钟，可用 `WEBHOOK_PULL_TIMEOUT` 调整。
+The health check is `GET /health`. Only one pull can run at a time; a concurrent request returns `409`. A pull runs for up to 10 minutes by default, configurable with `WEBHOOK_PULL_TIMEOUT`.
 
-这个 webhook 只负责拉取镜像，不会自动重启现有容器。这样可以避免一次外部请求直接中断线上服务；如需自动部署，应在 pull 成功后增加明确的、针对固定 compose 项目的重启步骤。
+This webhook only pulls images; it does not automatically restart existing containers. This prevents an external request from interrupting a live service. For automatic deployment, add an explicit restart step for a fixed Compose project after a successful pull.

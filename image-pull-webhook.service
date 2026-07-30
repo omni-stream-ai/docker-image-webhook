@@ -1,5 +1,5 @@
 [Unit]
-Description=Drawing Agent image pull webhook
+Description=Container image pull webhook
 After=network-online.target
 Wants=network-online.target
 
