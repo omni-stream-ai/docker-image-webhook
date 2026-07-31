@@ -25,6 +25,8 @@ By default, the service listens only on `127.0.0.1:19090`. It is recommended to 
 
 For private repositories, run `podman login` or `docker login` as the user that runs this service. The systemd example runs as root, so registry credentials must also be configured for root.
 
+When Podman is selected, the installation script and systemd unit automatically prepare its rootful storage and runtime directories. No manual systemd override or directory creation is required.
+
 ## systemd installation
 
 On the first installation, specify the only repository allowed to trigger pulls. Use its full image repository name for generic registry events. The script builds the program, generates a random secret, installs the systemd unit, and starts the service:

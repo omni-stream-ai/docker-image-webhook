@@ -93,6 +93,7 @@ echo "Building ${SERVICE_NAME}..."
 
 install -m 0755 "${build_dir}/${SERVICE_NAME}" "$INSTALL_BIN"
 install -d -m 0750 "$CONFIG_DIR"
+install -d -m 0700 /var/lib/containers
 install -m 0644 "${script_dir}/${SERVICE_NAME}.service" "$UNIT_FILE"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
