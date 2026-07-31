@@ -10,13 +10,10 @@ EnvironmentFile=/etc/drawing-agent/image-pull-webhook.env
 ExecStart=/usr/local/bin/image-pull-webhook
 Restart=on-failure
 RestartSec=3s
-RuntimeDirectory=libpod containers
-RuntimeDirectoryMode=0700
-ReadWritePaths=/var/lib/containers /run/libpod /run/containers
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ProtectSystem=strict
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
