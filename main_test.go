@@ -13,9 +13,11 @@ import (
 func TestPayloadPullsAllowedImage(t *testing.T) {
 	cfg := testConfig()
 	s := &server{config: cfg}
-	var pulled string
+	pulled := make(chan string, 1)
+	allowPullFinish := make(chan struct{})
 	s.pull = func(_ context.Context, image string) error {
-		pulled = image
+		pulled <- image
+		<-allowPullFinish
 		return nil
 	}
 
@@ -24,17 +26,30 @@ func TestPayloadPullsAllowedImage(t *testing.T) {
 	response := httptest.NewRecorder()
 	s.payloadHandler(response, req)
 
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if pulled != "registry.cn-hangzhou.aliyuncs.com/namespace/repo-test:latest" {
-		t.Fatalf("pulled image = %q", pulled)
+	select {
+	case image := <-pulled:
+		if image != "registry.cn-hangzhou.aliyuncs.com/namespace/repo-test:latest" {
+			t.Fatalf("pulled image = %q", image)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pull was not called")
 	}
+	if !s.pulling.Load() {
+		t.Fatal("server must remain busy while image pull is running")
+	}
+	close(allowPullFinish)
 }
 
 func TestPayloadAcceptsAdditionalAliyunFields(t *testing.T) {
 	s := &server{config: testConfig()}
-	s.pull = func(_ context.Context, _ string) error { return nil }
+	pulled := make(chan struct{})
+	s.pull = func(_ context.Context, _ string) error {
+		close(pulled)
+		return nil
+	}
 	body := strings.Replace(
 		testPayload("namespace/repo-test", "latest"),
 		`"repo_full_name":"namespace/repo-test"`,
@@ -45,9 +60,10 @@ func TestPayloadAcceptsAdditionalAliyunFields(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	s.payloadHandler(response, req)
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
+	<-pulled
 }
 
 func TestPayloadPullsGenericRegistryImages(t *testing.T) {
@@ -61,9 +77,9 @@ func TestPayloadPullsGenericRegistryImages(t *testing.T) {
 				"ghcr.io/acme/widget":                    {},
 				"registry.example.com:5000/team/service": {},
 			}
-			var pulled string
+			pulled := make(chan string, 1)
 			s := &server{config: cfg, pull: func(_ context.Context, image string) error {
-				pulled = image
+				pulled <- image
 				return nil
 			}}
 			req := httptest.NewRequest(http.MethodPost, "/payload?secret=test-secret", strings.NewReader(body))
@@ -71,10 +87,12 @@ func TestPayloadPullsGenericRegistryImages(t *testing.T) {
 			response := httptest.NewRecorder()
 			s.payloadHandler(response, req)
 
-			if response.Code != http.StatusOK {
+			if response.Code != http.StatusAccepted {
 				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 			}
-			if pulled == "" {
+			select {
+			case <-pulled:
+			case <-time.After(time.Second):
 				t.Fatal("pull was not called")
 			}
 		})
@@ -99,6 +117,8 @@ func TestPayloadRunsPostPullCommandAfterPull(t *testing.T) {
 	cfg := testConfig()
 	cfg.postPullCommand = "/usr/local/bin/redeploy"
 	var steps []string
+	postPullStarted := make(chan struct{})
+	allowPostPullFinish := make(chan struct{})
 	s := &server{
 		config: cfg,
 		pull: func(_ context.Context, image string) error {
@@ -107,6 +127,8 @@ func TestPayloadRunsPostPullCommandAfterPull(t *testing.T) {
 		},
 		postPull: func(_ context.Context, image string) error {
 			steps = append(steps, "post:"+image)
+			close(postPullStarted)
+			<-allowPostPullFinish
 			return nil
 		},
 	}
@@ -115,29 +137,86 @@ func TestPayloadRunsPostPullCommandAfterPull(t *testing.T) {
 	response := httptest.NewRecorder()
 	s.payloadHandler(response, req)
 
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"status":"accepted"`) {
+		t.Fatalf("body = %s", response.Body.String())
+	}
+	select {
+	case <-postPullStarted:
+	case <-time.After(time.Second):
+		t.Fatal("post-pull command did not start")
 	}
 	want := []string{"pull:registry.cn-hangzhou.aliyuncs.com/namespace/repo-test:latest", "post:registry.cn-hangzhou.aliyuncs.com/namespace/repo-test:latest"}
 	if strings.Join(steps, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("steps = %v, want %v", steps, want)
 	}
+	if !s.pulling.Load() {
+		t.Fatal("server must remain busy while post-pull command is running")
+	}
+	close(allowPostPullFinish)
 }
 
-func TestPayloadReportsPostPullFailure(t *testing.T) {
+func TestPayloadReturnsBeforePostPullFailure(t *testing.T) {
 	cfg := testConfig()
 	cfg.postPullCommand = "/usr/local/bin/redeploy"
+	postPullFinished := make(chan struct{})
 	s := &server{
 		config:   cfg,
 		pull:     func(_ context.Context, _ string) error { return nil },
-		postPull: func(_ context.Context, _ string) error { return errors.New("deploy failed") },
+		postPull: func(_ context.Context, _ string) error {
+			defer close(postPullFinished)
+			return errors.New("deploy failed")
+		},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/payload?secret=test-secret", strings.NewReader(testPayload("namespace/repo-test", "latest")))
 	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	s.payloadHandler(response, req)
-	if response.Code != http.StatusBadGateway {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	select {
+	case <-postPullFinished:
+	case <-time.After(time.Second):
+		t.Fatal("post-pull command did not finish")
+	}
+}
+
+func TestPullFailureDoesNotRunPostPullCommand(t *testing.T) {
+	cfg := testConfig()
+	cfg.postPullCommand = "/usr/local/bin/redeploy"
+	updateFinished := make(chan struct{})
+	postPullCalled := make(chan struct{}, 1)
+	s := &server{
+		config: cfg,
+		pull: func(_ context.Context, _ string) error {
+			defer close(updateFinished)
+			return errors.New("pull failed")
+		},
+		postPull: func(_ context.Context, _ string) error {
+			postPullCalled <- struct{}{}
+			return nil
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/payload?secret=test-secret", strings.NewReader(testPayload("namespace/repo-test", "latest")))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	s.payloadHandler(response, req)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	select {
+	case <-updateFinished:
+	case <-time.After(time.Second):
+		t.Fatal("image update did not finish")
+	}
+	waitForServerIdle(t, s)
+	select {
+	case <-postPullCalled:
+		t.Fatal("post-pull command ran after a failed pull")
+	default:
 	}
 }
 
@@ -183,6 +262,17 @@ func testConfig() config {
 		allowedRepos:     map[string]struct{}{"namespace/repo-test": {}},
 		pullTimeout:      time.Minute,
 		registryTemplate: "registry.%s.aliyuncs.com",
+	}
+}
+
+func waitForServerIdle(t *testing.T, s *server) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for s.pulling.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("server did not become idle")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

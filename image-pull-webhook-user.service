@@ -1,0 +1,16 @@
+[Unit]
+Description=Container image pull webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/image-pull-webhook/env
+ExecStart=%h/.local/bin/image-pull-webhook
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

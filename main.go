@@ -101,7 +101,7 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      cfg.pullTimeout + 5*time.Second,
+		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
 	log.Printf("image pull webhook listening on %s using %s", cfg.listenAddr, cfg.engine)
@@ -174,33 +174,40 @@ func (s *server) payloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.pulling.CompareAndSwap(false, true) {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "an image pull is already running"})
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "an image update is already running"})
 		return
 	}
+	go s.executeImageUpdate(image, event.PushData.Digest)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "image": image})
+}
+
+func (s *server) executeImageUpdate(image, digest string) {
 	defer s.pulling.Store(false)
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.pullTimeout)
-	defer cancel()
-	log.Printf("pulling image %s (digest %s)", image, event.PushData.Digest)
-	if err := s.pull(ctx, image); err != nil {
+	pullCtx, cancelPull := context.WithTimeout(context.Background(), s.config.pullTimeout)
+	defer cancelPull()
+	log.Printf("pulling image %s (digest %s)", image, digest)
+	if err := s.pull(pullCtx, image); err != nil {
 		log.Printf("image pull failed for %s: %v", image, err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "image pull failed"})
 		return
 	}
+	cancelPull()
 	log.Printf("image pull completed for %s", image)
-	if s.config.postPullCommand != "" {
-		postPull := s.postPull
-		if postPull == nil {
-			postPull = s.runPostPull
-		}
-		if err := postPull(ctx, image); err != nil {
-			log.Printf("post-pull command failed for %s: %v", image, err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "post-pull command failed"})
-			return
-		}
-		log.Printf("post-pull command completed for %s", image)
+	if s.config.postPullCommand == "" {
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "pulled", "image": image})
+
+	postPullCtx, cancelPostPull := context.WithTimeout(context.Background(), s.config.pullTimeout)
+	defer cancelPostPull()
+	postPull := s.postPull
+	if postPull == nil {
+		postPull = s.runPostPull
+	}
+	if err := postPull(postPullCtx, image); err != nil {
+		log.Printf("post-pull command failed for %s: %v", image, err)
+		return
+	}
+	log.Printf("post-pull command completed for %s", image)
 }
 
 func (s *server) imageFor(event payload) (string, error) {
